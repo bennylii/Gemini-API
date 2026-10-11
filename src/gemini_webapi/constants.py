@@ -27,10 +27,12 @@ def build_model_header(model_id: str, capacity_tail: str | int) -> dict[str, str
     """
     Builds the complete HTTP header dictionary required for model selection.
 
-    Format reverse-engineered from the Gemini web browser client (17 elements).
-    Key differences from pre-2026 format:
-      - Position 7: null (was 0) — 0 suppresses thinking
-      - Position 13: thinking level (5=thinking, 3=normal)
+    Format reverse-engineered from the Gemini web browser client (17 elements, May 2026).
+    Key elements:
+      - Position 7: 0
+      - Position 8: [4]
+      - Position 11: capacity_tail
+      - Position 14: thinking level (5=thinking, 3=normal)
       - Position 16: session-stable random UUID
     """
 
@@ -39,8 +41,8 @@ def build_model_header(model_id: str, capacity_tail: str | int) -> dict[str, str
 
     return {
         MODEL_HEADER_KEY: (
-            f'[1,null,null,null,"{model_id}",null,null,null,[4],null,null,'
-            f'{capacity_tail},null,{thinking_level},null,null,"{header_uuid}"]'
+            f'[1,null,null,null,"{model_id}",null,null,0,[4],null,null,'
+            f'{capacity_tail},null,null,{thinking_level},null,"{header_uuid}"]'
         ),
         "x-goog-ext-73010989-jspb": "[0]",
         "x-goog-ext-73010990-jspb": "[0]",

@@ -35,6 +35,7 @@ from .exceptions import (
     GeminiError,
     ModelInvalid,
     TemporarilyBlocked,
+    ThinkingQuotaExceeded,
     TimeoutError,
     UsageLimitExceeded,
 )
@@ -126,6 +127,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
         "refresh_task",
         "watchdog_timeout",
         "verbose",
+        "impersonate",
         "_running",
         "_cookies",
         "_reqid",
@@ -142,6 +144,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
         secure_1psidts: str | None = None,
         proxy: str | None = None,
         cookies: dict | Cookies | None = None,
+        impersonate: str = "chrome",
         **kwargs,
     ):
         super().__init__()
@@ -162,6 +165,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
         self.refresh_task: Task | None = None
         self.watchdog_timeout: float = 120  # seconds before declaring a zombie stream
         self.verbose: bool = False
+        self.impersonate: str = impersonate
         self._running: bool = False
         self._cookies = Cookies()
         self._reqid: int = random.randint(10000, 99999)
@@ -234,6 +238,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
         refresh_interval: float = 600,
         watchdog_timeout: float = 120,
         verbose: bool = False,
+        impersonate: str | None = None,
     ) -> None:
         """
         Get SNlM0e value as access token. Without this token posting will fail with 400 bad request.
@@ -278,6 +283,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                     proxy=self.proxy,
                     verbose=self.verbose,
                     verify=self.kwargs.get("verify", True),
+                    impersonate=impersonate or self.impersonate,
                 )
 
                 session.timeout = timeout
@@ -907,7 +913,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                     inner_req_list[55] = [[1]]
                 inner_req_list[61] = []
                 inner_req_list[68] = 2
-                inner_req_list[79] = 5 if _is_thinking_model_param(model) else 3
+                inner_req_list[79] = 5 if _is_thinking_model_param(model) else 1
 
                 uuid_val = str(uuid.uuid4()).upper()
 
@@ -921,7 +927,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                 }
 
                 request_data = {
-                    "at": self.access_token,
+                    "at": self.access_token or "",
                     "f.req": json.dumps(
                         [
                             None,
@@ -963,11 +969,16 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                     is_final_chunk = False  # Check if this turn is saved to history and marked complete or still pending (e.g., video generation).
                     cid = chat.cid if chat else ""
                     rid = chat.rid if chat else ""
+                    is_thinking_model = _is_thinking_model_param(model)
+                    had_thoughts = False
+                    # Buffer for thinking models: don't yield until we confirm
+                    # thinking is available (avoid streaming text before 429)
+                    pending_outputs = [] if is_thinking_model else None
 
                     async def _process_parts(
                         parts: list[Any],
                     ) -> AsyncGenerator[ModelOutput, None]:
-                        nonlocal is_thinking, is_queueing, has_candidates, is_completed, is_final_chunk, cid, rid
+                        nonlocal is_thinking, is_queueing, has_candidates, is_completed, is_final_chunk, cid, rid, had_thoughts
                         for part in parts:
                             # Check for fatal error codes
                             error_code = get_nested_value(part, [5, 2, 0, 1, 0])
@@ -1180,6 +1191,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                                                 rcid
                                             ) or last_thoughts.get(f"idx_{i}", "")
                                             if thoughts:
+                                                had_thoughts = True
                                                 thoughts_delta, new_full_thought = (
                                                     get_delta_by_fp_len(
                                                         thoughts,
@@ -1227,15 +1239,48 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                                                 )
                                             )
 
-                                        if output_candidates:
-                                            is_thinking = False
-                                            is_queueing = False
-                                            yield ModelOutput(
-                                                metadata=[cid, rid],
-                                                candidates=output_candidates,
-                                            )
+                                            if output_candidates:
+                                                is_thinking = False
+                                                is_queueing = False
+                                                output = ModelOutput(
+                                                    metadata=[cid, rid],
+                                                    candidates=output_candidates,
+                                                )
+                                                # thinking 模型缓冲策略：
+                                                # 在确认 had_thoughts 之前暂存所有输出不 yield。
+                                                # 原因：若配额耗尽，Google 会静默降级（无 thoughts），
+                                                # 而 proxy 收到首个 yield 就已发出 200+SSE 头，
+                                                # 异常无法再逆转状态码。缓冲可保证客户端要么收到
+                                                # 完整思考流，要么直接拿到 429。
+                                                if pending_outputs is not None and not had_thoughts:
+                                                    pending_outputs.append(output)
+                                                else:
+                                                    for p in pending_outputs or []:
+                                                        yield p
+                                                    if pending_outputs is not None:
+                                                        pending_outputs.clear()
+                                                    yield output
                                 except json.JSONDecodeError:
                                     continue
+
+                        # Detect thinking model silent fallback (quota exhausted without error code)
+                        # Only trigger when account is AVAILABLE — expired cookies also cause
+                        # missing thoughts but that's an auth issue, not a quota issue.
+                        if (is_completed and is_thinking_model and not had_thoughts
+                                and self.account_status == AccountStatus.AVAILABLE):
+                            logger.debug(
+                                f"[ThoughtsDiag] Detection trigger: is_completed={is_completed}, "
+                                f"is_thinking_model={is_thinking_model}, had_thoughts={had_thoughts}, "
+                                f"buffered={len(pending_outputs) if pending_outputs else 0}"
+                            )
+                            # Clear buffer — nothing was sent to client yet
+                            if pending_outputs:
+                                pending_outputs.clear()
+                            await self.close()
+                            raise ThinkingQuotaExceeded(
+                                f"Thinking model quota exhausted for '{model.model_name}'. "
+                                "The model silently fell back to non-thinking mode. Please wait a few minutes before retrying."
+                            )
 
                     chunk_iterator = response.aiter_content().__aiter__()
                     while True:
@@ -1364,6 +1409,8 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                                             if chat:
                                                 recovered.metadata = chat.metadata
                                                 chat.rcid = rec_rcid
+                                            if recovered.thoughts:
+                                                had_thoughts = True
                                             yield recovered
                                             break
                                         else:
@@ -1465,6 +1512,16 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
         text = ARTIFACTS_RE.sub("", text)
 
         thoughts = get_nested_value(candidate_data, [37, 0, 0]) or ""
+        raw_37 = get_nested_value(candidate_data, [37])
+        if raw_37 is not None:
+            logger.debug(
+                f"[ThoughtsDiag] pos[37] type={type(raw_37).__name__}, "
+                f"len={len(raw_37) if isinstance(raw_37, list) else 'N/A'}, "
+                f"pos[37][0]={get_nested_value(candidate_data, [37, 0])}, "
+                f"pos[37][0][0]={get_nested_value(candidate_data, [37, 0, 0])}"
+            )
+        else:
+            logger.debug("[ThoughtsDiag] pos[37] is None/missing")
 
         # Image handling
         web_images = []

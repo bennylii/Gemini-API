@@ -47,6 +47,7 @@ async def get_access_token(
     proxy: str | None = None,
     verbose: bool = False,
     verify: bool = True,
+    impersonate: str = "chrome",
 ) -> tuple[str | None, str | None, str | None, str | None, str | None, AsyncSession]:
     """
     Send a get request to gemini.google.com for each group of available cookies and return
@@ -78,7 +79,7 @@ async def get_access_token(
     """
 
     client = AsyncSession(
-        impersonate="chrome", proxy=proxy, allow_redirects=True, verify=verify
+        impersonate=impersonate, proxy=proxy, allow_redirects=True, verify=verify
     )
 
     # Set base cookies BEFORE preflight so Google sees authenticated request

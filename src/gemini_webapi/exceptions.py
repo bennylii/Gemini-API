@@ -46,6 +46,14 @@ class UsageLimitExceeded(GeminiError):
     pass
 
 
+class ThinkingQuotaExceeded(UsageLimitExceeded):
+    """
+    Exception for thinking model quota exhausted — model silently fell back to non-thinking.
+    """
+
+    pass
+
+
 class ModelInvalid(GeminiError):
     """
     Exception for invalid model header string errors.
